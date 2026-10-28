@@ -1647,13 +1647,25 @@ void bench_moe() {
         ma.limit = 10.0f;
         const bool uniform = ks == k1;
         float one = -1;
+        std::vector<float> o1;
         if (uniform) {   // (all K 1: also through the one-layout kernels, every expert at its own address)
             ma.lay = mix.lay[0];
             one = time(ma);
+            o1 = host_copy(d_out, (size_t) E);
         }
         ma.mix = mix;
         const float mixed = time(ma);
         const std::vector<float> o = host_copy(d_out, (size_t) E);
+        if (!o1.empty()) {   // the one-layout kernels (an EXL3_XSPLIT split) against the mixed ones (none)
+            double mx = 0, num = 0, den = 0;
+            for (int i = 0; i < E; ++i) {
+                const double d = (double) o1[i] - o[i];
+                mx = std::max(mx, std::fabs(d));
+                num += d * d;
+                den += (double) o[i] * o[i];
+            }
+            std::printf("  bench one layout vs mixed: rel %.3g, max |diff| %.3g\n", std::sqrt(num / den), mx);
+        }
         uint64_t hsh = 1469598103934665603ull;
         for (float v : o) {
             uint32_t u;

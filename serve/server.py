@@ -3208,17 +3208,18 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
     """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
-    if not os.environ.get("STRATA_DEBUG"):
+    if not (os.environ.get("STRATA_DEBUG") or os.environ.get("MAYA_LOG_REQ")):
         return
     last = messages[-1] if messages else {}
     body = last.get("content")
     if isinstance(body, list):
         body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
     preview = (str(body or "")[:80]).replace("\n", " ")
-    print(f"[maya] req {api}: msgs={len(messages)} tools={len(tools or [])} "
+    print(f"[maya] req {api}: model={req.get('model')!r} msgs={len(messages)} tools={len(tools or [])} "
           f"max_tokens_raw={req.get('max_tokens')!r}/{req.get('max_completion_tokens')!r} "
           f"max_new={max_new} thinking={thinking} stream={bool(req.get('stream'))} "
-          f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
+          f"prompt_tokens={prompt_tokens} last={last.get('role')!r}"
+          + ("" if os.environ.get("MAYA_LOG_REQ") else f":{preview!r}"), flush=True)
 
 
 # ------------------------------------------------------------------------------------------------ MCP tool loop

@@ -3841,6 +3841,7 @@ struct Model::Impl {
             d.attn_scr.max_t = kAttnScratchT;
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
+            if (!attn_part_alloc(d, d.attn_scr, err)) return false;
             d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
             if ((decode_trim & 1) && !(dalloc(d, d.shq8, (size_t) kWin * g.ff, err) &&
                                        dalloc(d, d.shd8, (size_t) kWin * g.ff / 32, err)))
@@ -8555,6 +8556,7 @@ struct Model::Impl {
                     return false;
                 d.mscr.max_t = kWin;
                 d.mscr.cap = (int) topk_stride();
+                if (!attn_part_alloc(d, d.mscr, err)) return false;
             }
         if (multi_attn)
             std::fprintf(stderr, "ds4: a multi step's attention for all its rows in one launch a step, %.1f MB a GPU "
@@ -9200,6 +9202,14 @@ struct Model::Impl {
         return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
     }
     size_t topk_stride() const { return (size_t) std::max(g.ix_topk, 32); }
+    // (attn_split_rows) the few-queries scratch's split partials: a query's rows at most its window's (and a
+    // window's queries) and the selection's, a split a tile at least
+    bool attn_part_alloc(Dev& d, AttnScratch& scr, std::string& err) {
+        if (attn_split_rows() <= 0 || g.hd != 512) return true;
+        scr.part_h = g.heads;
+        scr.part_s = (int) ((g.win + kWin + topk_stride() + 63) / 64);
+        return dalloc(d, scr.part, (size_t) scr.max_t * scr.part_h * scr.part_s * kAttPart, err);
+    }
     size_t cand_stride() const { return (size_t) std::max(g.cand_topk, 32); }
     size_t bm_stride() const { return (size_t) (o.max_context + 64) / std::max(1, g.cand_blk) + 64; }
     static constexpr int kSlots = kWin * kPicks;   // the CPU lane's (token, expert) rows a window can need

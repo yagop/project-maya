@@ -1554,29 +1554,43 @@ __global__ void block_max_kernel(const float* __restrict__ score, long long stri
 // ---------------------------------------------------------------- sparse attention, a block a (head, query)
 constexpr int kAttTile = 64;
 
+// query t's window rows (from window buffer row w0) and selected compressed rows - the attention kernels' count
+__host__ __device__ __forceinline__ void attn_counts(const AttnRows& ar, int t, int& n_win, int& n_sel, int& w0) {
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long lo = (long long) ar.win - ar.p0, first = lo > ta + 1 ? lo : ta + 1;   // (max(0, pa - win + 1))
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        const long long ns = ar.R > 0 ? (pa + 1) / ar.R : 0;
+        n_sel = (int) (ns < (long long) ar.kcap ? ns : (long long) ar.kcap);
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+}
+
 // kContig: query t's selected rows are ckv's rows t * sel_stride .. (the scratch of rows decoded once a query) - read
 // without sel, a warp's rows of a tile loaded kPre at a time before their dots (0: as the BF16 kernel); the
-// arithmetic the same
-template <bool kContig, int kPre = 0>
-__global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __restrict__ q,
-                                                               const uint16_t* __restrict__ win,
-                                                               const uint16_t* __restrict__ ckv,
-                                                               const int* __restrict__ sel, int sel_stride,
-                                                               AttnRows ar, const float* __restrict__ sink, int heads,
-                                                               int d, float scale, float* __restrict__ out) {
-    pdl_wait();
-    pdl_trigger();
+// arithmetic the same.  kSplit (sparse_attn_split_kernel): block z takes rows [z * split, + split) of its query's
+// (split a multiple of the tile: the same tiles), its running max, denominator and unnormalized outputs to part for
+// attn_combine_kernel - unless the query's rows are one split, where the block ends as the one-block kernel does (the
+// same bits)
+template <bool kContig, int kPre, bool kSplit>
+__device__ __forceinline__ void sparse_attn_block(const float* __restrict__ q, const uint16_t* __restrict__ win,
+                                                  const uint16_t* __restrict__ ckv, const int* __restrict__ sel,
+                                                  int sel_stride, const AttnRows& ar, const float* __restrict__ sink,
+                                                  int heads, int d, float scale, float* __restrict__ out,
+                                                  float* __restrict__ part, int split) {
     // d == 512: a thread owns 2 output values, a lane 16 of a row's dot
     const int h = blockIdx.x, t = blockIdx.y;
     int n_win, n_sel, w0;
-    if (ar.gen) {
-        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
-        const long long first = max((long long) ar.win - ar.p0, ta + 1);   // the window buffer row of max(0, pa - win + 1)
-        w0 = (int) first;
-        n_win = (int) (ar.win + ta - first + 1);
-        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
-    } else {
-        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    attn_counts(ar, t, n_win, n_sel, w0);
+    const int total = n_win + n_sel;
+    int r0 = 0, r1 = total, ns = 1;
+    if (kSplit) {
+        ns = (total + split - 1) / split;
+        if ((int) blockIdx.z >= ns) return;
+        r0 = (int) blockIdx.z * split;
+        r1 = min(total, r0 + split);
     }
     const uint16_t* wbase = win + (size_t) w0 * d;
     const int* sl = sel + (size_t) t * sel_stride;
@@ -1592,9 +1606,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     float o0 = 0.0f, o1 = 0.0f;
-    const int total = n_win + n_sel;
-    for (int t0 = 0; t0 < total; t0 += kAttTile) {
-        const int nt = min(kAttTile, total - t0);
+    for (int t0 = r0; t0 < r1; t0 += kAttTile) {
+        const int nt = min(kAttTile, r1 - t0);
         if (threadIdx.x < nt) {
             const int j = t0 + threadIdx.x;
             rows[threadIdx.x] = j < n_win ? wbase + (size_t) j * d
@@ -1685,8 +1698,69 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
             }
         __syncthreads();
     }
+    if (kSplit && ns > 1) {
+        float* rec = part + (((size_t) t * heads + h) * gridDim.z + blockIdx.z) * kAttPart;
+        const int c = threadIdx.x * 2;
+        rec[c] = o0;
+        rec[c + 1] = o1;
+        if (threadIdx.x == 0) rec[512] = m_run_s, rec[513] = den_s;
+        return;
+    }
     const float den = den_s + expf(sink[h] - m_run_s);
     const int c = threadIdx.x * 2;
+    float* ov = out + ((size_t) t * heads + h) * d;
+    ov[c] = o0 / den;
+    ov[c + 1] = o1 / den;
+}
+template <bool kContig, int kPre = 0>
+__global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __restrict__ q,
+                                                               const uint16_t* __restrict__ win,
+                                                               const uint16_t* __restrict__ ckv,
+                                                               const int* __restrict__ sel, int sel_stride,
+                                                               AttnRows ar, const float* __restrict__ sink, int heads,
+                                                               int d, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    sparse_attn_block<kContig, kPre, false>(q, win, ckv, sel, sel_stride, ar, sink, heads, d, scale, out, nullptr, 0);
+}
+// (attn_split_rows) the few-queries kernel with a query's rows over gridDim.z blocks of split rows a head
+__global__ void __launch_bounds__(kThreads) sparse_attn_split_kernel(const float* __restrict__ q,
+                                                                     const uint16_t* __restrict__ win,
+                                                                     const uint16_t* __restrict__ ckv, AttnRows ar,
+                                                                     const float* __restrict__ sink, int heads,
+                                                                     int d, float scale, float* __restrict__ out,
+                                                                     int sel_stride, float* __restrict__ part,
+                                                                     int split) {
+    pdl_wait();
+    pdl_trigger();
+    sparse_attn_block<true, 0, true>(q, win, ckv, nullptr, sel_stride, ar, sink, heads, d, scale, out, part, split);
+}
+// a split query's (head, query) output from its splits' partials: each rescaled to their largest running max and
+// added up in split order, the sink's term last, as the one-block kernel adds it.  Queries of one split were written
+// by their block already
+__global__ void __launch_bounds__(kThreads) attn_combine_kernel(const float* __restrict__ part, AttnRows ar,
+                                                                const float* __restrict__ sink, int heads, int d,
+                                                                int split, int smax, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
+    const int h = blockIdx.x, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    attn_counts(ar, t, n_win, n_sel, w0);
+    const int ns = (n_win + n_sel + split - 1) / split;
+    if (ns <= 1) return;
+    const float* rec = part + ((size_t) t * heads + h) * smax * kAttPart;
+    float m = -1e30f;
+    for (int i = 0; i < ns; ++i) m = fmaxf(m, rec[(size_t) i * kAttPart + 512]);
+    const int c = threadIdx.x * 2;
+    float den = 0.0f, o0 = 0.0f, o1 = 0.0f;
+    for (int i = 0; i < ns; ++i) {
+        const float* r = rec + (size_t) i * kAttPart;
+        const float f = expf(r[512] - m);
+        den += r[513] * f;
+        o0 += r[c] * f;
+        o1 += r[c + 1] * f;
+    }
+    den += expf(sink[h] - m);
     float* ov = out + ((size_t) t * heads + h) * d;
     ov[c] = o0 / den;
     ov[c + 1] = o1 / den;
@@ -4250,6 +4324,55 @@ static bool attn_mma_now() {
 static bool attn_scr_fits(int T, int sel_stride, const AttnScratch* scr) {
     return scr != nullptr && scr->rows != nullptr && T <= scr->max_t && sel_stride <= scr->cap;
 }
+
+int attn_split_rows() {
+    static const int env = [] {
+        const char* v = std::getenv("DS4_ATTN_SPLIT");
+        if (v == nullptr) return -1;
+        const int r = std::atoi(v);
+        return r <= 0 ? 0 : (r + kAttTile - 1) / kAttTile * kAttTile;
+    }();
+    if (env >= 0) return env;
+#if defined(STRATA_USE_HIP)
+    static std::atomic<int> known[64];   // 0: not asked yet, else the rows + 1
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return 0;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp p{};
+        v = 1 + (cudaGetDeviceProperties(&p, dev) == cudaSuccess && (std::strncmp(p.gcnArchName, "gfx942", 6) == 0 ||
+                                                                     std::strncmp(p.gcnArchName, "gfx950", 6) == 0)
+                     ? 64 : 0);
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v - 1;
+#else
+    return 0;
+#endif
+}
+
+// the few-queries kernel on the decoded rows: one block a (head, query), or (attn_split_rows, the scratch's partials
+// room) a query's rows split over several blocks a head and their partials combined - the split each query's own
+// (its rows alone), so a query's bits do not depend on the others of its launch
+static void attn_few_launch(const float* q, const uint16_t* win, const AttnRows& a, const float* sink, int heads,
+                            int d, int T, float scale, float* out, cudaStream_t s, const AttnScratch* scr) {
+    const int split = attn_split_rows();
+    int smax = 1;
+    if (split > 0 && scr->part != nullptr && heads <= scr->part_h && T <= scr->max_t)
+        for (int t = 0; t < T; ++t) {
+            int n_win, n_sel, w0;
+            attn_counts(a, t, n_win, n_sel, w0);
+            smax = std::max(smax, (n_win + n_sel + split - 1) / split);
+        }
+    if (smax > 1 && smax <= scr->part_s) {
+        pdl_launch(sparse_attn_split_kernel, dim3(heads, T, smax), kThreads, 0, s, q, win, scr->rows, a, sink, heads, d,
+                   scale, out, scr->cap, scr->part, split);
+        pdl_launch(attn_combine_kernel, dim3(heads, T), kThreads, 0, s, scr->part, a, sink, heads, d, split, smax, out);
+        return;
+    }
+    pdl_launch(sparse_attn_kernel<true, 0>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
+               heads, d, scale, out);
+}
 bool attn_few(int T, int sel_stride, const AttnScratch* scr) {
     return T <= kAttnScratchT && attn_scr_fits(T, sel_stride, scr);
 }
@@ -4294,13 +4417,12 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
                    scr->cap, scr->rows);
 #if !defined(STRATA_USE_HIP)
-        if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
+        if (T == 1 && attn_split_rows() == 0)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
             pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                        heads, d, scale, out);
         else
 #endif
-            pdl_launch(sparse_attn_kernel<true, 0>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
-                       heads, d, scale, out);
+            attn_few_launch(q, win, a, sink, heads, d, T, scale, out, s, scr);
         return;
     }
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
@@ -4337,15 +4459,14 @@ bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, con
     pdl_launch(unpack_sel_rows_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, c, sel, sel_stride, a, scr->cap,
                scr->rows);
 #if !defined(STRATA_USE_HIP)
-    if (one)
+    if (one && attn_split_rows() == 0)
         pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
                    heads, d, scale, out);
     else
 #else
     (void) one;
 #endif
-        pdl_launch(sparse_attn_kernel<true, 0>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
-                   heads, d, scale, out);
+        attn_few_launch(q, win, a, sink, heads, d, T, scale, out, s, scr);
     return true;
 }
 

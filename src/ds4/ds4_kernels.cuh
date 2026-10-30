@@ -217,7 +217,15 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
 struct AttnScratch {
     uint16_t* rows = nullptr;   // [max_t * cap][512] BF16
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
+    // (attn_split_rows) the split partials: [max_t][part_h][part_s][kAttPart] - null: no split
+    float* part = nullptr;
+    int part_h = 0, part_s = 0;
 };
+constexpr int kAttPart = 516;   // a split's partial: its 512 unnormalized outputs, its running max and its denominator
+/// The few-queries kernel's rows a block when a query's rows split over several blocks (a multiple of 64, its tiles);
+/// 0: one block a (head, query).  DS4_ATTN_SPLIT=<rows> sets it (0 off); by default 64 on CDNA (gfx942 / gfx950: a
+/// decode step's 64 heads fill a quarter of a MI350X's 256 CUs), 0 elsewhere.
+int attn_split_rows();
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
 // heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3/4 (gfx11/gfx12), 16 heads a block on matrix cores - the
 // products in BF16 (the query and the probabilities as a high and a low part: within rounding of the FP32 kernels,

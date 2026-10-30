@@ -2708,6 +2708,21 @@ __global__ void combine_kernel(const float* __restrict__ ed, const float* __rest
     out[(size_t) t * dim + e] = a;
 }
 
+// the k largest of bs[0 .. n) into pick[0 .. k): larger first, ties to the lower index - the order k rounds of the
+// block's argmax (each taking its pick out) took them in, so the same picks in the same order, in one pass instead of
+// k barriers apart: a value's place is the count of those above it and its equals before it.  NaN is never picked, as
+// the argmax never took one.  Every thread of the block, bs written before; pick ready after a __syncthreads
+__device__ __forceinline__ void top_k_rank(const float* bs, int n, int k, int* pick) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = bs[i];
+        if (v != v) continue;
+        int rank = 0;
+#pragma unroll 8
+        for (int j = 0; j < n; ++j) rank += bs[j] > v || (bs[j] == v && j < i);
+        if (rank < k) pick[rank] = i;
+    }
+}
+
 __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restrict__ logits,
                                                             const float* __restrict__ bias, int n, int k,
                                                             float route_scale, const unsigned long long* __restrict__ vram,
@@ -2718,8 +2733,6 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
-    __shared__ float bv[32];
-    __shared__ int bi[32];
     __shared__ int pick[16];
     __shared__ int on_cpu;
     const int t = blockIdx.x;
@@ -2732,50 +2745,29 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         bs[i] = sc[i] + bias[i];
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    for (int r = 0; r < k; ++r) {
-        float best = -FLT_MAX;
-        int bix = 0x7fffffff;
-        for (int i = threadIdx.x; i < n; i += blockDim.x)
-            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
-        for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
-            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
-        }
-        if (lane == 0) bv[wp] = best, bi[wp] = bix;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float b = -FLT_MAX;
-            int ix = 0x7fffffff;
-            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
-                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
-            pick[r] = ix;
-            bs[ix] = -FLT_MAX;
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
+    top_k_rank(bs, n, k, pick);
+    if (threadIdx.x == 0) on_cpu = 0;
+    __syncthreads();
+    // a thread a pick (their table reads at once, not one after another): the weights' sum in pick order, as before
+    if (threadIdx.x < k) {
+        const int r = threadIdx.x, e = pick[r];
         float s = 0.0f;
-        for (int r = 0; r < k; ++r) s += sc[pick[r]];
-        int cpu = 0;
-        for (int r = 0; r < k; ++r) {
-            const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
-            idx[(size_t) t * kPicks + r] = pick[r];
-            w[(size_t) t * kPicks + r] = wv;
-            plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
-            cpu |= vram[pick[r]] == 0ull;
-            if (req != nullptr) {
-                req->ids[t][r] = pick[r];
-                req->w[t][r] = wv;
-            }
+        for (int q = 0; q < k; ++q) s += sc[pick[q]];
+        const float wv = sc[e] / (s + 1e-20f) * route_scale;
+        const unsigned long long v = vram[e];
+        idx[(size_t) t * kPicks + r] = e;
+        w[(size_t) t * kPicks + r] = wv;
+        plan_ptr[(size_t) t * kPicks + r] = v;
+        if (v == 0ull) on_cpu = 1;
+        if (req != nullptr) {
+            req->ids[t][r] = e;
+            req->w[t][r] = wv;
         }
-        on_cpu = cpu;
-        if (cpu && cpu_any != nullptr) atomicOr(cpu_any, 1);
     }
     // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
     // 20 KB over PCIe, where most windows have none
     __syncthreads();
+    if (threadIdx.x == 0 && on_cpu && cpu_any != nullptr) atomicOr(cpu_any, 1);
     if (req != nullptr && on_cpu)
         for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
 }
